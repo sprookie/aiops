@@ -1,0 +1,8 @@
+langchain>=1.0.0
+langgraph>=1.0.0
+langchain-openai>=0.2.0
+rich>=13.7.1
+typer>=0.12.4
+prompt_toolkit>=3.0.43
+paramiko>=3.4.0
+python-dotenv>=1.0.1
