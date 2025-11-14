@@ -5,11 +5,11 @@ from typing import Dict, List, Optional, TypedDict, Any
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import SystemMessage, HumanMessage
 
-from .llm import get_llm
-from .prompts import SYSTEM_PROMPT, REFLECT_PROMPT
-from .shell import ShellExecutor
-from .config import RuntimeConfig
-from .visual import render_graph_status, render_preview_command, render_execution_output
+from ops_agent.llm import get_llm
+from ops_agent.prompts import SYSTEM_PROMPT, REFLECT_PROMPT
+from ops_agent.shell import ShellExecutor
+from ops_agent.config import RuntimeConfig
+from ops_agent.visual import render_graph_status, render_preview_command, render_execution_output
 
 # 仅用于类型注解，避免在本地CLI环境下缺失时报错
 try:
