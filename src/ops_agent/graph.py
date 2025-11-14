@@ -1,5 +1,6 @@
+import os
 import json
-from typing import Dict, List, Optional, TypedDict
+from typing import Dict, List, Optional, TypedDict, Any
 
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -7,7 +8,14 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from .llm import get_llm
 from .prompts import SYSTEM_PROMPT, REFLECT_PROMPT
 from .shell import ShellExecutor
+from .config import RuntimeConfig
 from .visual import render_graph_status, render_preview_command, render_execution_output
+
+# 仅用于类型注解，避免在本地CLI环境下缺失时报错
+try:
+    from langgraph_api.runnable import RunnableConfig  # type: ignore
+except Exception:  # pragma: no cover
+    RunnableConfig = Any  # 动态兼容，无强制依赖
 
 
 class AgentState(TypedDict):
@@ -17,6 +25,9 @@ class AgentState(TypedDict):
     approval: Optional[bool]
     observation: str
     continue_flag: bool
+    # 新增：中断相关字段与决策路由
+    decision: Optional[str]  # "approve" | "reject" | "interrupt"
+    interrupt_text: Optional[str]
 
 
 def _safe_json_loads(text: str) -> Dict:
@@ -34,7 +45,40 @@ def _safe_json_loads(text: str) -> Dict:
         return {"command": "", "rationale": "解析失败", "visual_hint": "", "risk": "unknown"}
 
 
-def build_app(executor: ShellExecutor, non_interactive_decline: bool = False):
+def build_app(config: RunnableConfig):
+    """LangGraph CLI 工厂函数：必须接收一个参数(RunnableConfig)。
+
+    在此处根据 config.metadata 或环境变量构建执行器与图。
+    """
+
+    def _meta(key: str, default: Any = None) -> Any:
+        try:
+            md = getattr(config, "metadata", {}) or {}
+            return md.get(key, default)
+        except Exception:
+            return default
+
+    # 从 metadata 或环境变量推导运行配置
+    execution_mode = _meta("execution_mode", os.environ.get("OPS_EXECUTION_MODE", "dry_run"))
+    timeout_seconds = int(_meta("timeout_seconds", os.environ.get("OPS_TIMEOUT_SECONDS", 60)))
+    ssh_host = _meta("ssh_host", os.environ.get("OPS_SSH_HOST"))
+    ssh_user = _meta("ssh_user", os.environ.get("OPS_SSH_USER"))
+    ssh_key_path = _meta("ssh_key_path", os.environ.get("OPS_SSH_KEY_PATH"))
+    ssh_port = int(_meta("ssh_port", os.environ.get("OPS_SSH_PORT", 22)))
+    non_interactive_decline = bool(_meta(
+        "non_interactive_decline",
+        os.environ.get("OPS_NON_INTERACTIVE_DECLINE", "0") in ("1", "true", "True")
+    ))
+
+    runtime_cfg = RuntimeConfig(
+        execution_mode=execution_mode,
+        timeout_seconds=timeout_seconds,
+        ssh_host=ssh_host,
+        ssh_user=ssh_user,
+        ssh_key_path=ssh_key_path,
+        ssh_port=ssh_port,
+    )
+    executor = ShellExecutor(runtime_cfg)
     llm = get_llm()
 
     def analyze_node(state: AgentState):
@@ -71,11 +115,21 @@ def build_app(executor: ShellExecutor, non_interactive_decline: bool = False):
             c.get("visual_hint", ""),
         )
         if non_interactive_decline:
+            # 非交互模式直接拒绝
             approve = False
+            decision = "reject"
         else:
-            ans = input("确认执行该命令吗？[y/N]: ").strip().lower()
-            approve = ans in ("y", "yes")
-        return {"approval": approve}
+            ans = input("确认执行该命令吗？[y/N/i] (y=执行, n=拒绝, i=中断沟通): ").strip().lower()
+            if ans in ("y", "yes"):
+                approve = True
+                decision = "approve"
+            elif ans in ("i", "interrupt"):
+                approve = None
+                decision = "interrupt"
+            else:
+                approve = False
+                decision = "reject"
+        return {"approval": approve, "decision": decision}
 
     def execute_node(state: AgentState):
         render_graph_status("execute", approval_needed=False)
@@ -126,11 +180,13 @@ def build_app(executor: ShellExecutor, non_interactive_decline: bool = False):
             "history": history,
         }
 
+
     graph = StateGraph(AgentState)
     graph.add_node("analyze", analyze_node)
     graph.add_node("confirm", confirm_node)
     graph.add_node("execute", execute_node)
     graph.add_node("reflect", reflect_node)
+    # 不再使用单独的中断节点，改为在确认处直接结束本轮
 
     graph.set_entry_point("analyze")
     graph.add_edge("analyze", "confirm")
@@ -138,8 +194,8 @@ def build_app(executor: ShellExecutor, non_interactive_decline: bool = False):
     # 确认后的条件路由：批准->执行；拒绝->反思
     graph.add_conditional_edges(
         "confirm",
-        lambda s: bool(s.get("approval", False)),
-        {True: "execute", False: "reflect"},
+        lambda s: s.get("decision"),
+        {"approve": "execute", "reject": "reflect", "interrupt": END},
     )
 
     graph.add_edge("execute", "reflect")
@@ -150,6 +206,8 @@ def build_app(executor: ShellExecutor, non_interactive_decline: bool = False):
         lambda s: bool(s.get("continue_flag", False)),
         {True: "confirm", False: END},
     )
+
+    # 中断后直接结束本轮，CLI将保留上下文以继续对话
 
     app = graph.compile()
     return app

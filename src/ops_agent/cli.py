@@ -7,10 +7,8 @@ from rich.panel import Panel
 import typer
 from dotenv import load_dotenv
 
-from .config import RuntimeConfig
-from .shell import ShellExecutor
-from .graph import build_app
-from .llm import DEFAULT_BASE_URL
+from ops_agent.graph import build_app
+from ops_agent.llm import DEFAULT_BASE_URL
 
 
 console = Console()
@@ -41,15 +39,21 @@ def run(
 
     _set_deepseek_env()
 
-    cfg = RuntimeConfig(
-        execution_mode=execution_mode,
-        timeout_seconds=timeout,
-        ssh_host=ssh_host,
-        ssh_user=ssh_user,
-        ssh_key_path=ssh_key_path,
-    )
-    executor = ShellExecutor(cfg)
-    app = build_app(executor, non_interactive_decline=bool(once))
+    # 为本地CLI构造与LangGraph兼容的轻量配置对象
+    class SimpleConfig:
+        def __init__(self, metadata: Dict):
+            self.metadata = metadata
+
+    metadata = {
+        "execution_mode": execution_mode,
+        "timeout_seconds": timeout,
+        "ssh_host": ssh_host,
+        "ssh_user": ssh_user,
+        "ssh_key_path": ssh_key_path,
+        # CLI一次性模式下默认非交互拒绝确认
+        "non_interactive_decline": bool(once),
+    }
+    app = build_app(SimpleConfig(metadata))
 
     if once:
         user_input = once.strip()
@@ -60,6 +64,8 @@ def run(
             "approval": None,
             "observation": "",
             "continue_flag": False,
+            "decision": None,
+            "interrupt_text": None,
         }
         try:
             final = app.invoke(state)
@@ -69,6 +75,9 @@ def run(
         return
 
     console.print(Panel("Linux 运维Agent已启动。输入你的目标或命令（输入 exit 退出）", title="DeepSeek LangGraph 运维Agent"))
+
+    # 会话级上下文：跨回合保留历史，支持中断后继续对话
+    session_history = []
 
     while True:
         try:
@@ -84,17 +93,22 @@ def run(
         # 初始状态
         state: Dict = {
             "user_input": user_input,
-            "history": [],
+            "history": session_history,
             "candidate": {"command": "", "rationale": "", "visual_hint": "", "risk": "low"},
             "approval": None,
             "observation": "",
             "continue_flag": False,
+            "decision": None,
+            "interrupt_text": None,
         }
 
         # 运行一次完整流程（LangGraph会根据边自动流转）
         try:
             final = app.invoke(state)
             console.print(Panel(str(final), title="最终状态", border_style="cyan"))
+            # 更新会话历史，以便下一回合继续上下文
+            if isinstance(final, dict) and "history" in final:
+                session_history = final["history"]
         except Exception as e:
             console.print(Panel(f"执行出错: {e}", title="错误", border_style="red"))
 
